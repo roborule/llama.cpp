@@ -16,7 +16,7 @@ from pathlib import Path
 from hashlib import sha256
 from typing import TYPE_CHECKING, Any, Callable, ContextManager, Iterable, Iterator, Literal, Sequence, TypeVar, cast
 from itertools import chain
-from transformers import AutoConfig, AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer, PreTrainedTokenizerFast
 
 import math
 import numpy as np
@@ -1265,19 +1265,28 @@ class TextModel(ModelBase):
             ], optional=True) or tokenizer.vocab_size()
             tokenizer_vocab_size = tokenizer.vocab_size()
         elif tokenizer_json_path.is_file():
-            tokenizer = AutoTokenizer.from_pretrained(self.dir_model)
+            try:
+                tokenizer = AutoTokenizer.from_pretrained(self.dir_model, tokenizer_file=str(tokenizer_json_path))
+            except Exception as err:
+                logger.warning("Falling back to PreTrainedTokenizerFast: %s", err)
+                tokenizer = PreTrainedTokenizerFast(tokenizer_file=str(tokenizer_json_path))
             with open(tokenizer_json_path, "r", encoding="utf-8") as f:
                 tokenizer_json = json.load(f)
 
             if tokenizer_config_path.is_file():
                 with open(tokenizer_config_path, "r", encoding="utf-8") as f:
-                    tokenizer_config_json = json.load(f)
+                    try:
+                        tokenizer_config_json = json.load(f)
+                    except json.JSONDecodeError as err:
+                        logger.warning("Ignoring invalid tokenizer_config.json: %s", err)
+                        tokenizer_config_json = {}
 
+            tokenizer_vocab_size = tokenizer.vocab_size if tokenizer.vocab_size is not None else len(tokenizer.get_vocab())
             vocab_size = self.find_hparam([
                 "vocab_size_per_layer_input", # gemma3n
                 "vocab_size",
-            ], optional=True) or tokenizer.vocab_size
-            tokenizer_vocab_size = tokenizer.vocab_size
+            ], optional=True) or int(tokenizer_vocab_size)
+            tokenizer_vocab_size = int(tokenizer_vocab_size)
         else:
             raise FileNotFoundError(f"File not found: {tokenizer_path}")
 
