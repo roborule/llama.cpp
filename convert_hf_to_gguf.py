@@ -16,7 +16,7 @@ from pathlib import Path
 from hashlib import sha256
 from typing import TYPE_CHECKING, Any, Callable, ContextManager, Iterable, Iterator, Literal, Sequence, TypeVar, cast
 from itertools import chain
-from transformers import AutoConfig
+from transformers import AutoConfig, AutoTokenizer
 
 import math
 import numpy as np
@@ -1251,40 +1251,81 @@ class TextModel(ModelBase):
         from sentencepiece import SentencePieceProcessor
 
         tokenizer_path = self.dir_model / 'tokenizer.model'
+        tokenizer_json_path = self.dir_model / 'tokenizer.json'
+        tokenizer_config_path = self.dir_model / 'tokenizer_config.json'
+        tokenizer_json: dict[str, Any] = {}
+        tokenizer_config_json: dict[str, Any] = {}
 
-        if not tokenizer_path.is_file():
+        if tokenizer_path.is_file():
+            tokenizer: SentencePieceProcessor | Any = SentencePieceProcessor()
+            tokenizer.LoadFromFile(str(tokenizer_path))
+            vocab_size = self.find_hparam([
+                "vocab_size_per_layer_input", # gemma3n
+                "vocab_size",
+            ], optional=True) or tokenizer.vocab_size()
+            tokenizer_vocab_size = tokenizer.vocab_size()
+        elif tokenizer_json_path.is_file():
+            tokenizer = AutoTokenizer.from_pretrained(self.dir_model)
+            with open(tokenizer_json_path, "r", encoding="utf-8") as f:
+                tokenizer_json = json.load(f)
+
+            if tokenizer_config_path.is_file():
+                with open(tokenizer_config_path, "r", encoding="utf-8") as f:
+                    tokenizer_config_json = json.load(f)
+
+            vocab_size = self.find_hparam([
+                "vocab_size_per_layer_input", # gemma3n
+                "vocab_size",
+            ], optional=True) or tokenizer.vocab_size
+            tokenizer_vocab_size = tokenizer.vocab_size
+        else:
             raise FileNotFoundError(f"File not found: {tokenizer_path}")
-
-        tokenizer = SentencePieceProcessor()
-        tokenizer.LoadFromFile(str(tokenizer_path))
-
-        vocab_size = self.find_hparam([
-            "vocab_size_per_layer_input", # gemma3n
-            "vocab_size",
-        ], optional=True) or tokenizer.vocab_size()
 
         tokens: list[bytes] = [f"[PAD{i}]".encode("utf-8") for i in range(vocab_size)]
         scores: list[float] = [-10000.0] * vocab_size
         toktypes: list[int] = [SentencePieceTokenTypes.UNUSED] * vocab_size
 
-        for token_id in range(tokenizer.vocab_size()):
+        added_vocab: dict[str, int] = {}
+        unk_token_id: int | None = None
+        if not isinstance(tokenizer, SentencePieceProcessor):
+            added_vocab = tokenizer.get_added_vocab()
+            unk_token = tokenizer_config_json.get("unk_token")
+            unk_token_id = added_vocab.get(unk_token, tokenizer_json["model"].get("unk_id", 0))
+
+        for token_id in range(tokenizer_vocab_size):
             if token_id >= vocab_size:
                 logger.warning(f'ignore tokens from {token_id}: id is out of range, max={vocab_size - 1}')
                 break
 
-            piece = tokenizer.IdToPiece(token_id)
-            text = piece.encode("utf-8")
-            score = tokenizer.GetScore(token_id)
+            if isinstance(tokenizer, SentencePieceProcessor):
+                piece = tokenizer.IdToPiece(token_id)
+                text = piece.encode("utf-8")
+                score = tokenizer.GetScore(token_id)
 
-            toktype = SentencePieceTokenTypes.NORMAL
-            if tokenizer.IsUnknown(token_id):
-                toktype = SentencePieceTokenTypes.UNKNOWN
-            elif tokenizer.IsControl(token_id):
-                toktype = SentencePieceTokenTypes.CONTROL
-            elif tokenizer.IsUnused(token_id):
-                toktype = SentencePieceTokenTypes.UNUSED
-            elif tokenizer.IsByte(token_id):
-                toktype = SentencePieceTokenTypes.BYTE
+                toktype = SentencePieceTokenTypes.NORMAL
+                if tokenizer.IsUnknown(token_id):
+                    toktype = SentencePieceTokenTypes.UNKNOWN
+                elif tokenizer.IsControl(token_id):
+                    toktype = SentencePieceTokenTypes.CONTROL
+                elif tokenizer.IsUnused(token_id):
+                    toktype = SentencePieceTokenTypes.UNUSED
+                elif tokenizer.IsByte(token_id):
+                    toktype = SentencePieceTokenTypes.BYTE
+            else:
+                piece = tokenizer._convert_id_to_token(token_id)
+                if piece is None:
+                    continue
+
+                text = piece.encode("utf-8")
+                score = tokenizer_json["model"]["vocab"][token_id][1]
+
+                toktype = SentencePieceTokenTypes.NORMAL
+                if unk_token_id is not None and token_id == unk_token_id:
+                    toktype = SentencePieceTokenTypes.UNKNOWN
+                elif token_id in tokenizer.all_special_ids:
+                    toktype = SentencePieceTokenTypes.CONTROL
+                elif token_id in added_vocab.values():
+                    toktype = SentencePieceTokenTypes.USER_DEFINED
 
             tokens[token_id] = text
             scores[token_id] = score
